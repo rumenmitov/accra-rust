@@ -1,14 +1,18 @@
 import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, override
 
 from accra_language import AccraError, Config, Dependency, Manifest, ManifestSpec
 
+from .utils import PROFILES, safe_names
+
 # A project that pins no toolchain builds with either.
 DEFAULT_VERSIONS = frozenset({"stable", "nightly"})
 
 _DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
-_SKIPPED_DIRS = {"target", ".git", "node_modules"}
+_SKIPPED_DIRS = {"target", ".git", "node_modules", "vendor", "third_party"}
+_SEARCH_DEPTH = 3
 
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -47,8 +51,83 @@ def read_toml(path: Path) -> dict[str, Any] | None:
     return None if text is None else parse_toml(text, path)
 
 
-def pinned_toolchain(cwd: Path) -> str | None:
-    """The channel `rust-toolchain.toml` or `rust-toolchain` pins, if any."""
+def project_root(cwd: Path) -> Path:
+    """The folder of the project's `Cargo.toml`: `cwd` itself when it holds one,
+    else the shallowest folder below it that does (a project whose crates live in
+    `rust/` or `source/`), a workspace manifest before a plain one. `cwd` when
+    there is none. Hidden folders, `target`, `vendor`, `third_party` and
+    `node_modules` are not searched, nor deeper than three levels."""
+    if (cwd / "Cargo.toml").is_file():
+        return cwd
+    level = [cwd]
+    for _ in range(_SEARCH_DEPTH):
+        found: list[Path] = []
+        below: list[Path] = []
+        for folder in level:
+            try:
+                children = sorted(folder.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if (
+                    not child.is_dir()
+                    or child.is_symlink()
+                    or child.name.startswith(".")
+                    or child.name in _SKIPPED_DIRS
+                ):
+                    continue
+                if (child / "Cargo.toml").is_file():
+                    found.append(child)
+                else:
+                    below.append(child)
+        if found:
+            for candidate in found:
+                table = read_toml(candidate / "Cargo.toml")
+                if table is not None and "workspace" in table:
+                    return candidate
+            return found[0]
+        level = below
+    return cwd
+
+
+@dataclass(frozen=True)
+class ToolchainPin:
+    """What a `rust-toolchain.toml` (or a legacy `rust-toolchain`) pins: the
+    channel, and the components, targets and profile its `[toolchain]` table adds.
+    A legacy file holds the channel only."""
+
+    channel: str
+    components: list[str] = field(default_factory=list)
+    targets: list[str] = field(default_factory=list)
+    profile: str | None = None
+
+
+def pinned_toolchain_spec(cwd: Path, top: Path | None = None) -> ToolchainPin | None:
+    """The pin `rust-toolchain.toml` or `rust-toolchain` holds, if any: in `cwd`,
+    else in the folders above it up to `top`. Components, targets and profile
+    come from the same file as the channel; names that are not plain are
+    dropped."""
+    folders = [cwd]
+    if top is not None:
+        current = cwd
+        while current != top and top in current.parents:
+            current = current.parent
+            folders.append(current)
+    for folder in folders:
+        pin = _pin_in(folder)
+        if pin is not None:
+            return pin
+    return None
+
+
+def pinned_toolchain(cwd: Path, top: Path | None = None) -> str | None:
+    """The channel `rust-toolchain.toml` or `rust-toolchain` pins, if any: in
+    `cwd`, else in the folders above it up to `top`."""
+    pin = pinned_toolchain_spec(cwd, top)
+    return pin.channel if pin else None
+
+
+def _pin_in(cwd: Path) -> ToolchainPin | None:
     for name in ("rust-toolchain.toml", "rust-toolchain"):
         path = cwd / name
         text = read_text(path)
@@ -57,14 +136,22 @@ def pinned_toolchain(cwd: Path) -> str | None:
         stripped = text.strip()
         if not stripped:
             continue
+        toolchain: dict[str, Any] = {}
         if name.endswith(".toml") or stripped.startswith("["):
             table = parse_toml(text, path)
-            toolchain = table.get("toolchain") if table else None
-            channel = toolchain.get("channel") if isinstance(toolchain, dict) else None
+            found = table.get("toolchain") if table else None
+            toolchain = found if isinstance(found, dict) else {}
+            channel = toolchain.get("channel")
         else:
             channel = stripped.splitlines()[0].strip()
         if isinstance(channel, str) and channel.strip():
-            return channel.strip()
+            profile = toolchain.get("profile")
+            return ToolchainPin(
+                channel=channel.strip(),
+                components=safe_names(toolchain.get("components")),
+                targets=safe_names(toolchain.get("targets")),
+                profile=profile if profile in PROFILES else None,
+            )
     return None
 
 
@@ -152,7 +239,7 @@ class Cargo_toml(Manifest):
         super().__init__(spec)
 
     def _root(self) -> Path:
-        return Path(self.spec.config.cwd or ".")
+        return project_root(Path(self.spec.config.cwd or "."))
 
     @override
     def detect(self) -> bool:
@@ -200,5 +287,5 @@ class Cargo_toml(Manifest):
     @override
     def get_supported_language_versions(self) -> set[str] | AccraError:
         """The toolchain the project pins, else stable and nightly."""
-        pinned = pinned_toolchain(self._root())
+        pinned = pinned_toolchain(self._root(), Path(self.spec.config.cwd or "."))
         return {pinned} if pinned else set(DEFAULT_VERSIONS)
