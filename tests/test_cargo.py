@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -14,8 +15,13 @@ from accra_language import (
 
 from accra_rust import Cargo, Cargo_toml, Rust
 from accra_rust.cargo import version_order
-from accra_rust.cargo_toml import pinned_toolchain
-from accra_rust.utils import BUILD_PACKAGES
+from accra_rust.cargo_toml import (
+    ToolchainPin,
+    pinned_toolchain,
+    pinned_toolchain_spec,
+    project_root,
+)
+from accra_rust.utils import BUILD_PACKAGES, safe_names
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rust-sample-project"
 
@@ -453,3 +459,363 @@ def test_hostile_lock(tmp_path: Path, case: str):
     MANIFEST_CASES[case](tmp_path / "Cargo.lock")
 
     assert isinstance(Cargo(Config(cwd=tmp_path)).installed_dependencies(), AccraError)
+
+
+# -- a project whose crates are not at the repository root -------------------
+
+
+def nested(tmp_path: Path, folder: str = "rust", workspace: bool = True) -> Path:
+    body = (
+        '[workspace]\nmembers = ["core"]\n'
+        if workspace
+        else '[package]\nname = "solo"\n[dependencies]\nrand = "0.8"\n'
+    )
+    write(tmp_path / folder / "Cargo.toml", body)
+    if workspace:
+        write(
+            tmp_path / folder / "core" / "Cargo.toml",
+            '[package]\nname = "core"\n[dependencies]\nitertools = "0.1"\n',
+        )
+    return tmp_path / folder
+
+
+def test_root_manifest_wins(tmp_path: Path):
+    write(tmp_path / "Cargo.toml", '[package]\nname = "top"\n')
+    nested(tmp_path)
+
+    assert project_root(tmp_path) == tmp_path
+
+
+def test_nested_manifest_is_found(tmp_path: Path):
+    folder = nested(tmp_path)
+    manifest = Cargo_toml(Config(cwd=tmp_path))
+
+    assert project_root(tmp_path) == folder
+    assert manifest.detect() is True
+    assert manifest.crate_names() == {"core"}
+    assert manifest.extract_dependencies() == {
+        Dependency(name="itertools", version="0.1")
+    }
+
+
+def test_shallowest_manifest_and_workspace_first(tmp_path: Path):
+    write(tmp_path / "tools" / "a" / "Cargo.toml", '[package]\nname = "a"\n')
+    write(tmp_path / "source" / "Cargo.toml", '[package]\nname = "plain"\n')
+    write(tmp_path / "libs" / "Cargo.toml", "[workspace]\nmembers = []\n")
+
+    # `source` and `libs` are both one level down: the workspace wins; `tools/a`
+    # is two levels down and never considered
+    assert project_root(tmp_path) == tmp_path / "libs"
+
+
+@pytest.mark.parametrize(
+    "skipped", ["target", "vendor", "third_party", "node_modules", ".hidden"]
+)
+def test_folders_that_are_not_the_project_are_skipped(tmp_path: Path, skipped: str):
+    write(tmp_path / skipped / "Cargo.toml", '[package]\nname = "x"\n')
+
+    assert project_root(tmp_path) == tmp_path
+    assert Cargo_toml(Config(cwd=tmp_path)).detect() is False
+
+
+def test_search_depth_is_bounded(tmp_path: Path):
+    write(tmp_path / "a" / "b" / "c" / "d" / "Cargo.toml", '[package]\nname = "x"\n')
+
+    assert project_root(tmp_path) == tmp_path
+
+
+def test_toolchain_pin_above_the_project_is_read(tmp_path: Path):
+    nested(tmp_path, "source")
+    write(tmp_path / "rust-toolchain.toml", '[toolchain]\nchannel = "1.88.0"\n')
+
+    manifest = Cargo_toml(Config(cwd=tmp_path))
+
+    assert pinned_toolchain(tmp_path / "source", tmp_path) == "1.88.0"
+    assert manifest.get_supported_language_versions() == {"1.88.0"}
+
+
+def test_toolchain_pin_in_the_project_wins(tmp_path: Path):
+    folder = nested(tmp_path)
+    write(tmp_path / "rust-toolchain.toml", '[toolchain]\nchannel = "1.88.0"\n')
+    write(
+        folder / "rust-toolchain.toml", '[toolchain]\nchannel = "nightly-2026-01-01"\n'
+    )
+
+    assert pinned_toolchain(folder, tmp_path) == "nightly-2026-01-01"
+
+
+def test_commands_run_in_the_project_folder(tmp_path: Path, monkeypatch):
+    folder = nested(tmp_path)
+    cwds: list[str] = []
+
+    def run(command, **kwargs):
+        cwds.append(str(kwargs.get("cwd")))
+        return completed()
+
+    monkeypatch.setattr("accra_rust.cargo.subprocess.run", run)
+    manager = Cargo(Config(cwd=tmp_path, language_version="stable", timeout=5))
+
+    assert manager.dependencies_installation().success
+    assert manager.post_dependencies_installation().success
+    assert set(cwds) == {str(folder)}
+
+
+def test_image_steps_go_to_the_project_folder(tmp_path: Path, monkeypatch):
+    nested(tmp_path, "source")
+    fake_run(monkeypatch, lambda c: completed())
+    manager = Cargo(Config(cwd=tmp_path, language_version="stable", timeout=5))
+
+    deps = manager.dependencies_installation().dockerfile
+    post = manager.post_dependencies_installation().dockerfile
+
+    assert "RUN cd source && cargo fetch" in deps.dependencies_installation
+    assert "RUN cd source && cargo build" in post.post_dependencies_installation
+
+
+def test_lock_file_is_read_from_the_project_folder(tmp_path: Path):
+    folder = nested(tmp_path)
+    write(
+        folder / "Cargo.lock",
+        '[[package]]\nname = "rand"\nversion = "0.8.5"\nsource = "registry+https://x"\n',
+    )
+    manager = Cargo(Config(cwd=tmp_path))
+
+    assert manager.installed_dependencies() == {
+        Dependency(name="rand", version="=0.8.5")
+    }
+
+
+def test_a_project_at_the_root_is_unchanged(tmp_path: Path, monkeypatch):
+    manager = project(tmp_path, "stable")
+    fake_run(monkeypatch, lambda c: completed())
+
+    assert (
+        "RUN cargo fetch"
+        in manager.dependencies_installation().dockerfile.dependencies_installation
+    )
+
+
+# -- components, targets and profile of the toolchain pin ---------------------
+
+PIN = """
+[toolchain]
+channel = "nightly-2026-01-01"
+components = ["rustc-dev", "llvm-tools", "rust-src"]
+targets = ["thumbv7em-none-eabi", "riscv32imc-unknown-none-elf"]
+"""
+
+
+def install_command(calls: list[list[str]]) -> list[str]:
+    return next(c for c in calls if c[:3] == ["rustup", "toolchain", "install"])
+
+
+def test_pin_components_targets_and_profile_are_parsed(tmp_path: Path):
+    write(
+        tmp_path / "rust-toolchain.toml",
+        PIN.replace("[toolchain]", '[toolchain]\nprofile = "default"'),
+    )
+
+    pin = pinned_toolchain_spec(tmp_path)
+
+    assert pin is not None
+    assert pin.channel == "nightly-2026-01-01"
+    assert pin.components == ["rustc-dev", "llvm-tools", "rust-src"]
+    assert pin.targets == ["thumbv7em-none-eabi", "riscv32imc-unknown-none-elf"]
+    assert pin.profile == "default"
+    assert pinned_toolchain(tmp_path) == "nightly-2026-01-01"
+
+
+def test_a_pin_without_extras_has_none(tmp_path: Path):
+    write(tmp_path / "rust-toolchain.toml", '[toolchain]\nchannel = "1.85.0"\n')
+
+    pin = pinned_toolchain_spec(tmp_path)
+
+    assert pin == ToolchainPin(channel="1.85.0")
+
+
+def test_a_legacy_pin_file_has_a_channel_only(tmp_path: Path):
+    write(tmp_path / "rust-toolchain", "nightly-2026-01-01\n")
+
+    pin = pinned_toolchain_spec(tmp_path)
+
+    assert pin == ToolchainPin(channel="nightly-2026-01-01")
+
+
+def test_the_build_installs_the_pins_components_and_targets(
+    tmp_path: Path, monkeypatch
+):
+    write(tmp_path / "rust-toolchain.toml", PIN)
+    manager = project(tmp_path)
+    calls = fake_run(monkeypatch, lambda c: completed())
+
+    assert manager.pre_dependencies_installation().success
+
+    assert install_command(calls) == [
+        "rustup", "toolchain", "install", "nightly-2026-01-01",
+        "--profile", "minimal",
+        "--component", "rustc-dev",
+        "--component", "llvm-tools",
+        "--component", "rust-src",
+        "--target", "thumbv7em-none-eabi",
+        "--target", "riscv32imc-unknown-none-elf",
+    ]  # fmt: skip
+
+
+def test_the_dockerfile_line_has_them_too(tmp_path: Path, monkeypatch):
+    write(tmp_path / "rust-toolchain.toml", PIN)
+    manager = project(tmp_path)
+    fake_run(monkeypatch, lambda c: completed())
+
+    pre = manager.pre_dependencies_installation().dockerfile
+    line = str(pre.pre_dependencies_installation[-1])
+
+    assert line == (
+        "RUN rustup toolchain install nightly-2026-01-01 --profile minimal "
+        "--component rustc-dev --component llvm-tools --component rust-src "
+        "--target thumbv7em-none-eabi --target riscv32imc-unknown-none-elf "
+        "&& rustup default nightly-2026-01-01"
+    )
+
+
+def test_the_pins_profile_is_used(tmp_path: Path, monkeypatch):
+    write(
+        tmp_path / "rust-toolchain.toml",
+        '[toolchain]\nchannel = "1.85.0"\nprofile = "default"\ncomponents = ["clippy"]\n',
+    )
+    manager = project(tmp_path)
+    calls = fake_run(monkeypatch, lambda c: completed())
+
+    manager.pre_dependencies_installation()
+
+    command = install_command(calls)
+    assert command[command.index("--profile") + 1] == "default"
+    assert command[-2:] == ["--component", "clippy"]
+
+
+@pytest.mark.parametrize("profile", ["fancy", 3, ["minimal"]])
+def test_an_unknown_profile_stays_minimal(tmp_path: Path, monkeypatch, profile):
+    write(
+        tmp_path / "rust-toolchain.toml",
+        f'[toolchain]\nchannel = "1.85.0"\nprofile = {profile!r}\n'.replace("'", '"'),
+    )
+    manager = project(tmp_path)
+    calls = fake_run(monkeypatch, lambda c: completed())
+
+    manager.pre_dependencies_installation()
+
+    command = install_command(calls)
+    assert command[command.index("--profile") + 1] == "minimal"
+
+
+def test_a_project_without_extras_installs_the_plain_toolchain(
+    tmp_path: Path, monkeypatch
+):
+    write(tmp_path / "rust-toolchain.toml", '[toolchain]\nchannel = "1.85.0"\n')
+    manager = project(tmp_path)
+    calls = fake_run(monkeypatch, lambda c: completed())
+
+    pre = manager.pre_dependencies_installation()
+
+    assert install_command(calls) == [
+        "rustup", "toolchain", "install", "1.85.0", "--profile", "minimal",
+    ]  # fmt: skip
+    assert str(pre.dockerfile.pre_dependencies_installation[-1]) == toolchain_line(
+        "1.85.0"
+    )
+
+
+def test_extras_follow_the_pin_not_a_version_the_caller_chose(
+    tmp_path: Path, monkeypatch
+):
+    write(tmp_path / "rust-toolchain.toml", PIN)
+    manager = project(tmp_path, version="stable")
+    calls = fake_run(monkeypatch, lambda c: completed())
+
+    pre = manager.pre_dependencies_installation()
+
+    assert install_command(calls) == [
+        "rustup", "toolchain", "install", "stable", "--profile", "minimal",
+    ]  # fmt: skip
+    assert str(pre.dockerfile.pre_dependencies_installation[-1]) == toolchain_line(
+        "stable"
+    )
+
+
+def test_a_pin_in_a_parent_folder_gives_its_extras(tmp_path: Path, monkeypatch):
+    nested(tmp_path, "source")
+    write(tmp_path / "rust-toolchain.toml", PIN)
+    manager = Cargo(Config(cwd=tmp_path, timeout=5))
+    calls = fake_run(monkeypatch, lambda c: completed())
+
+    assert manager.pre_dependencies_installation().success
+
+    command = install_command(calls)
+    assert command[3] == "nightly-2026-01-01"
+    assert command.count("--component") == 3
+    assert command.count("--target") == 2
+
+
+HOSTILE_NAMES = [
+    "rustc-dev; id",
+    "$(id)",
+    "`id`",
+    "a b",
+    "--profile",
+    "-x",
+    "x\nRUN id",
+    "../etc",
+    "a" * 65,
+    "",
+    "é",
+]
+
+
+@pytest.mark.parametrize("name", HOSTILE_NAMES)
+def test_hostile_component_and_target_names_are_dropped(
+    tmp_path: Path, monkeypatch, name: str
+):
+    write(
+        tmp_path / "rust-toolchain.toml",
+        '[toolchain]\nchannel = "1.85.0"\n'
+        f'components = [{json.dumps(name)}, "rust-src"]\n'
+        f'targets = [{json.dumps(name)}, "wasm32-unknown-unknown"]\n',
+    )
+    manager = project(tmp_path)
+    calls = fake_run(monkeypatch, lambda c: completed())
+
+    pre = manager.pre_dependencies_installation()
+
+    command = install_command(calls)
+    assert name not in command[command.index("--profile") + 2 :]
+    assert command[-4:] == [
+        "--component", "rust-src", "--target", "wasm32-unknown-unknown",
+    ]  # fmt: skip
+    line = str(pre.dockerfile.pre_dependencies_installation[-1])
+    assert line.count("\n") == 0 and ";" not in line and "$(" not in line
+
+
+@pytest.mark.parametrize(
+    "extras",
+    ['components = "rust-src"', "components = [1, 2]", "targets = { a = 1 }"],
+)
+def test_malformed_components_and_targets_are_ignored(
+    tmp_path: Path, monkeypatch, extras: str
+):
+    write(
+        tmp_path / "rust-toolchain.toml",
+        f'[toolchain]\nchannel = "1.85.0"\n{extras}\n',
+    )
+    manager = project(tmp_path)
+    calls = fake_run(monkeypatch, lambda c: completed())
+
+    assert manager.pre_dependencies_installation().success
+    assert install_command(calls) == [
+        "rustup", "toolchain", "install", "1.85.0", "--profile", "minimal",
+    ]  # fmt: skip
+
+
+def test_the_names_are_listed_once_and_bounded():
+    assert safe_names(["a", "a", "b"]) == ["a", "b"]
+    assert len(safe_names([f"c{i}" for i in range(500)])) == 64
+    assert safe_names("rust-src") == []
+    assert safe_names(None) == []

@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# not tracked: a lock would pin accra-language to one commit
+uv.lock
