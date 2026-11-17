@@ -3,6 +3,7 @@ from accra_language import (
     EnvironmentManager,
     Language,
     LanguageSpec,
+    PrologFact,
     Toolchain,
 )
 
@@ -41,3 +42,6 @@ class Rust(Language):
             toolchain=_TOOLCHAIN,
         )
         super().__init__(spec, env_manager=env_manager)
+
+    def extract_static_facts(self) -> set[PrologFact]:
+        return set()

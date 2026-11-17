@@ -262,7 +262,7 @@ class Cargo_toml(Manifest):
         return names
 
     @override
-    def extract_dependencies(self) -> set[Dependency] | None:
+    def extract_dependencies(self) -> set[Dependency]:
         """The crates every manifest of the workspace depends on, without the
         workspace's own crates. A dependency a member takes from the workspace
         (`workspace = true`) is the one `[workspace.dependencies]` names."""
@@ -282,7 +282,7 @@ class Cargo_toml(Manifest):
                     kept = found.get(dependency.name)
                     if kept is None or (not kept.version and dependency.version):
                         found[dependency.name] = dependency
-        return set(found.values()) or None
+        return set(found.values())
 
     @override
     def get_supported_language_versions(self) -> set[str] | AccraError:

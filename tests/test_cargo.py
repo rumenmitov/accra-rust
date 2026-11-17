@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 from accra_language import (
-    AccraError,
     AccraResult,
     Config,
     Dependency,
@@ -93,7 +92,7 @@ def test_dependencies_of_a_workspace(workspace: Path):
 
 
 def test_crate_names_of_a_workspace(workspace: Path):
-    assert Cargo(Config(cwd=workspace)).project_names() == {"app", "local"}
+    assert Cargo_toml(Config(cwd=workspace)).crate_names() == {"app", "local"}
 
 
 def test_no_manifest(tmp_path: Path):
@@ -137,22 +136,6 @@ def test_versions_of_a_project(tmp_path: Path):
 
     forced = Cargo(Config(cwd=tmp_path, language_version="1.80"))
     assert forced.select_language_version() == "1.80"
-
-
-def test_installed_dependencies_come_from_the_lock(tmp_path: Path):
-    write(tmp_path / "Cargo.toml", '[package]\nname = "x"\n')
-    manager = Cargo(Config(cwd=tmp_path))
-    assert isinstance(manager.installed_dependencies(), AccraError)
-
-    write(
-        tmp_path / "Cargo.lock",
-        '[[package]]\nname = "x"\nversion = "0.1.0"\n\n'
-        '[[package]]\nname = "rand"\nversion = "0.8.5"\n'
-        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
-    )
-    assert manager.installed_dependencies() == {
-        Dependency(name="rand", version="=0.8.5")
-    }
 
 
 def test_version_order():
@@ -204,7 +187,7 @@ def test_build_fetches_dependencies(tmp_path: Path):
     assert rust.detect() is True
     result = rust.build()
 
-    assert result.success, result.errors
+    assert not result.abort, result.facts
     assert "RUN cargo fetch" in result.dockerfile.dependencies_installation
 
 
@@ -272,7 +255,7 @@ def test_steps_succeed(tmp_path: Path, monkeypatch, step: str):
     result = run_step(manager, step)
 
     assert isinstance(result, AccraResult)
-    assert result.success, result.errors
+    assert not result.abort
     assert calls
 
 
@@ -293,13 +276,13 @@ def test_steps_fail_without_raising(tmp_path: Path, monkeypatch, step, outcome):
     result = run_step(manager, step)
 
     assert isinstance(result, AccraResult)
-    assert not result.success
-    assert len(result.errors) == 1
+    assert result.abort
+    assert len(result.facts) == 1
+    error = next(iter(result.facts))
     if outcome == "exit-101":
-        assert result.errors[0].exit_code == 101
-        assert "boom" in (result.errors[0].stderr or "")
+        assert "101" in error.error
     if outcome == "timeout":
-        assert "timed out" in result.errors[0].message
+        assert "timeout" in error.error
 
 
 def test_no_dependencies_skips_cargo_fetch(tmp_path: Path, monkeypatch):
@@ -308,7 +291,7 @@ def test_no_dependencies_skips_cargo_fetch(tmp_path: Path, monkeypatch):
 
     result = manager.dependencies_installation()
 
-    assert result.success
+    assert not result.abort
     assert calls == []
     assert not result.dockerfile.dependencies_installation
 
@@ -327,7 +310,7 @@ def parts(tmp_path: Path, monkeypatch, version: str) -> list[Dockerfile]:
         manager.dependencies_installation(),
         manager.post_dependencies_installation(),
     ]
-    assert all(r.success for r in results)
+    assert all(not r.abort for r in results)
     return [r.dockerfile for r in results]
 
 
@@ -418,7 +401,6 @@ def exercise(cwd: Path) -> None:
     rust = Rust(Config(cwd=cwd))
     manager = Cargo(Config(cwd=cwd))
     manager.supported_language_versions()
-    assert isinstance(manager.installed_dependencies(), (set, AccraError))
     rust.is_present()
 
 
@@ -427,7 +409,7 @@ def test_hostile_manifest(tmp_path: Path, case: str):
     MANIFEST_CASES[case](tmp_path / "Cargo.toml")
 
     assert not Cargo_toml(Config(cwd=tmp_path)).detect()
-    assert Cargo_toml(Config(cwd=tmp_path)).extract_dependencies() is None
+    assert Cargo_toml(Config(cwd=tmp_path)).extract_dependencies() == set()
     exercise(tmp_path)
 
 
@@ -451,14 +433,6 @@ def test_hostile_toolchain_file(tmp_path: Path, name: str, case: str):
         "stable",
         "nightly",
     }
-
-
-@pytest.mark.parametrize("case", sorted(MANIFEST_CASES))
-def test_hostile_lock(tmp_path: Path, case: str):
-    write(tmp_path / "Cargo.toml", '[package]\nname = "x"\n')
-    MANIFEST_CASES[case](tmp_path / "Cargo.lock")
-
-    assert isinstance(Cargo(Config(cwd=tmp_path)).installed_dependencies(), AccraError)
 
 
 # -- a project whose crates are not at the repository root -------------------
@@ -555,8 +529,8 @@ def test_commands_run_in_the_project_folder(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("accra_rust.cargo.subprocess.run", run)
     manager = Cargo(Config(cwd=tmp_path, language_version="stable", timeout=5))
 
-    assert manager.dependencies_installation().success
-    assert manager.post_dependencies_installation().success
+    assert not manager.dependencies_installation().abort
+    assert not manager.post_dependencies_installation().abort
     assert set(cwds) == {str(folder)}
 
 
@@ -568,21 +542,8 @@ def test_image_steps_go_to_the_project_folder(tmp_path: Path, monkeypatch):
     deps = manager.dependencies_installation().dockerfile
     post = manager.post_dependencies_installation().dockerfile
 
-    assert "RUN cd source && cargo fetch" in deps.dependencies_installation
-    assert "RUN cd source && cargo build" in post.post_dependencies_installation
-
-
-def test_lock_file_is_read_from_the_project_folder(tmp_path: Path):
-    folder = nested(tmp_path)
-    write(
-        folder / "Cargo.lock",
-        '[[package]]\nname = "rand"\nversion = "0.8.5"\nsource = "registry+https://x"\n',
-    )
-    manager = Cargo(Config(cwd=tmp_path))
-
-    assert manager.installed_dependencies() == {
-        Dependency(name="rand", version="=0.8.5")
-    }
+    assert "RUN (cd source && cargo fetch)" in deps.dependencies_installation
+    assert "RUN (cd source && cargo build)" in post.post_dependencies_installation
 
 
 def test_a_project_at_the_root_is_unchanged(tmp_path: Path, monkeypatch):
@@ -648,7 +609,7 @@ def test_the_build_installs_the_pins_components_and_targets(
     manager = project(tmp_path)
     calls = fake_run(monkeypatch, lambda c: completed())
 
-    assert manager.pre_dependencies_installation().success
+    assert not manager.pre_dependencies_installation().abort
 
     assert install_command(calls) == [
         "rustup", "toolchain", "install", "nightly-2026-01-01",
@@ -747,7 +708,7 @@ def test_a_pin_in_a_parent_folder_gives_its_extras(tmp_path: Path, monkeypatch):
     manager = Cargo(Config(cwd=tmp_path, timeout=5))
     calls = fake_run(monkeypatch, lambda c: completed())
 
-    assert manager.pre_dependencies_installation().success
+    assert not manager.pre_dependencies_installation().abort
 
     command = install_command(calls)
     assert command[3] == "nightly-2026-01-01"
@@ -808,7 +769,7 @@ def test_malformed_components_and_targets_are_ignored(
     manager = project(tmp_path)
     calls = fake_run(monkeypatch, lambda c: completed())
 
-    assert manager.pre_dependencies_installation().success
+    assert not manager.pre_dependencies_installation().abort
     assert install_command(calls) == [
         "rustup", "toolchain", "install", "1.85.0", "--profile", "minimal",
     ]  # fmt: skip
