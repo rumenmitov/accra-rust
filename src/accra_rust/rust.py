@@ -14,9 +14,11 @@ from accra_language import (
     doc_has_code_block,
     doc_mentions_command,
     doc_mentions_source_file,
+    multilingual_plugin_error,
     readme_has_code_block,
     readme_mentions_command,
     readme_mentions_source_file,
+    source_file,
 )
 from pydantic import BaseModel
 
@@ -55,19 +57,19 @@ class _RegexParser(ABC, BaseModel):
 
 class _RustFileNameParser(_RegexParser):
     @override
-    def regex() -> re.Pattern[str]:
+    def regex(self) -> re.Pattern[str]:
         return re.compile(r"(?i)\b([A-Za-z0-9_\-./]+\.rs)\b")
 
 
 class _RustCommandParser(_RegexParser):
     @override
-    def regex() -> re.Pattern[str]:
-        return re.compile(r"(?im)^\s*(?:rustc|cargo)\s+([^\s]+\.py)\b([^\n\r`]*)")
+    def regex(self) -> re.Pattern[str]:
+        return re.compile(r"(?im)^[ \t]*((?:rustc|cargo)\s+[^\n\r`]+?)[ \t]*(?:\r?$|`)")
 
 
 class _RustCodeBlockParser(_RegexParser):
     @override
-    def regex() -> re.Pattern[str]:
+    def regex(self) -> re.Pattern[str]:
         return re.compile(
             r"```rust\s*\n(.*?)```",
             re.IGNORECASE | re.DOTALL,
@@ -104,7 +106,7 @@ class Rust(Language):
         # handling in the future..
         for root, _, files in os.walk(self.spec.config.cwd):
             # NOTE keep the path relative to the project root
-            root_path: Path = Path(root.replace(self.spec.config.cwd, "."))
+            root_path: Path = Path(root.replace(str(self.spec.config.cwd), "."))
 
             # TODO how should we handle links?
             for file in files:
@@ -116,12 +118,12 @@ class Rust(Language):
     def _parse_root_readme(self) -> set[PrologFact]:
         """Extracts set of Rust-related prolog facts from the project's root README."""
         facts: set[PrologFact] = set()
-        README: Final[tuple(str)] = (
+        README: Final[tuple[str, ...]] = (
             "README",
             "readme",
         )
         # TODO add support for .org readmes in the future? not a priority!
-        README_EXT: Final[tuple(str)] = (
+        README_EXT: Final[tuple[str, ...]] = (
             ".md",
             ".txt",
         )
@@ -131,20 +133,31 @@ class Rust(Language):
         ]
 
         for readme in readme_files:
-            if not os.path.exists(readme):
+            readme_path: Path = self.spec.config.cwd / readme
+
+            if not os.path.exists(readme_path):
                 continue
 
             code_blocks: set[str] = set()
             commands: set[str] = set()
             source_files: set[str] = set()
 
-            with open(readme, "r") as file:
-                file_content: str = file.read()
+            try:
+                with open(readme_path, "r") as file:
+                    file_content: str = file.read()
 
-                code_blocks = set(self.code_block_parser.parse(file_content))
-                commands = set(self.command_parser.parse(file_content))
-                source_files = set(self.file_name_parser.parse(file_content))
-                # TODO parse for readme_mentions_symbol
+                    code_blocks = set(self.code_block_parser.parse(file_content))
+                    commands = set(self.command_parser.parse(file_content))
+                    source_files = set(self.file_name_parser.parse(file_content))
+                    # TODO parse for readme_mentions_symbol
+
+            except Exception:  # noqa: BLE001
+                return {
+                    multilingual_plugin_error(
+                        error=f"failed to open readme file: {readme_path}",
+                        plugin=type(self).__name__,
+                    )
+                }
 
             for code_block in code_blocks:
                 facts.add(
@@ -156,10 +169,10 @@ class Rust(Language):
             for command in commands:
                 facts.add(readme_mentions_command(command=command))
 
-            for source_file in source_files:
+            for source in source_files:
                 facts.add(
                     readme_mentions_source_file(
-                        language=type(self).__name__, source_file=source_file
+                        language=type(self).__name__, source_file=source
                     )
                 )
 
@@ -170,14 +183,14 @@ class Rust(Language):
         facts: set[PrologFact] = set()
         docs: set[Path] = set()
 
-        KNOWN_DOC_DIRS: tuple[str] = (
+        KNOWN_DOC_DIRS: tuple[str, ...] = (
             "docs",
             "doc",
         )
 
         # TODO should files without an extension also be considered
         # "docs"? e.g. README
-        KNOWN_DOC_FILE_EXTS: tuple[str] = (
+        KNOWN_DOC_FILE_EXTS: tuple[str, ...] = (
             ".md",
             ".txt",
         )
@@ -190,7 +203,7 @@ class Rust(Language):
 
             if os.path.basename(root_path) in KNOWN_DOC_DIRS:
                 for file in files:
-                    docs.add(root / file)
+                    docs.add(root_path / file)
 
             else:
                 for file in files:
@@ -207,39 +220,53 @@ class Rust(Language):
         for doc in docs:
             doc_absolute_path = self.spec.config.cwd / doc
 
-            code_blocks: set[tuple[Path, str]] = set()
-            commands: set[tuple[Path, str]] = set()
-            source_files: set[tuple[Path, str]] = set()
+            code_blocks: set[tuple[Path, frozenset[str]]] = set()
+            commands: set[tuple[Path, frozenset[str]]] = set()
+            source_files: set[tuple[Path, frozenset[str]]] = set()
 
-            with open(doc_absolute_path, "r") as file:
-                file_content: str = file.read()
+            try:
+                with open(doc_absolute_path, "r") as file:
+                    file_content: str = file.read()
 
-                code_blocks = (doc, set(self.code_block_parser.parse(file_content)))
-                commands = (doc, set(self.command_parser.parse(file_content)))
-                source_files = (doc, set(self.file_name_parser.parse(file_content)))
-                # TODO parse for doc_mentions_symbol,
-                # doc_command_for_target, documented_entry_point
-
-            for doc_path, code_block in code_blocks:
-                facts.add(
-                    doc_has_code_block(
-                        doc=doc_path,
-                        language=type(self).__name__,
-                        code_block=code_block,
+                    code_blocks.add(
+                        (doc, frozenset(self.code_block_parser.parse(file_content)))
                     )
-                )
-
-            for doc_path, command in commands:
-                facts.add(doc_mentions_command(doc=doc_path, command=command))
-
-            for doc_path, source_file in source_files:
-                facts.add(
-                    doc_mentions_source_file(
-                        doc=doc_path,
-                        language=type(self).__name__,
-                        source_file=source_file,
+                    commands.add(
+                        (doc, frozenset(self.command_parser.parse(file_content)))
                     )
-                )
+                    source_files.add(
+                        (doc, frozenset(self.file_name_parser.parse(file_content)))
+                    )
+                    # TODO parse for doc_mentions_symbol,
+                    # doc_command_for_target, documented_entry_point
+
+            except Exception:  # noqa: S112, BLE001
+                # NOTE skip files that cannot be opened
+                continue
+
+            for doc_path, doc_code_blocks in code_blocks:
+                for code_block in doc_code_blocks:
+                    facts.add(
+                        doc_has_code_block(
+                            doc=doc_path,
+                            language=type(self).__name__,
+                            code_block=code_block,
+                        )
+                    )
+
+            for doc_path, doc_commands in commands:
+                for command in doc_commands:
+                    facts.add(doc_mentions_command(doc=doc_path, command=command))
+
+            for doc_path, doc_source_files in source_files:
+                for source in doc_source_files:
+                    facts.add(
+                        doc_mentions_source_file(
+                            doc=doc_path,
+                            language=type(self).__name__,
+                            source_file=source,
+                        )
+                    )
 
         return facts
 
@@ -248,10 +275,10 @@ class Rust(Language):
 
         # record source files
         for file in self._get_all_source_files():
-            facts.add(language=type(self).__name__, path=file)
+            facts.add(source_file(language=type(self).__name__, path=file))
 
         # record facts from the root readme
-        facts.update(self._parse_readme())
+        facts.update(self._parse_root_readme())
 
         # record facts from the docs in the project
         facts.update(self._parse_docs())
